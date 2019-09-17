@@ -1,0 +1,81 @@
+package com.example.nasa.data.source
+
+import androidx.lifecycle.LiveData
+import androidx.paging.LivePagedListBuilder
+import androidx.paging.PagedList
+import com.example.nasa.BuildConfig
+import com.example.nasa.data.APod
+import com.example.nasa.data.source.local.APodDao
+import com.example.nasa.data.source.remote.APodApiService
+import com.example.nasa.utils.DateUtils
+import com.example.nasa.utils.isAfter
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import timber.log.Timber
+import java.util.*
+import javax.inject.Inject
+
+class APodRepository
+@Inject constructor(
+    private val localSource: APodDao,
+    private val remoteSource: APodApiService
+) {
+
+    private val aPodBoundaryCallback = APodBoundaryCallback(
+        localSource = localSource,
+        remoteSource = remoteSource
+    )
+    val networkState = aPodBoundaryCallback.networkState
+
+    suspend fun getLatestAPod() {
+        // I could probably move this in onItemAtFrontLoaded of BoundaryCallback.
+        // But I wanted to avoid checking every time top the page is reached.
+        // This method is only called and checked every time MainViewModel is created,
+        // so essentially when app is first opened.
+        val currentCal = Calendar.getInstance(DateUtils.americanTimeZone)
+        val lastLatestAPod = localSource.getLatestAPodDate()
+
+        if (lastLatestAPod != null) {
+            val lastLatestAPodCal = Calendar.getInstance().apply {
+                time = lastLatestAPod
+            }
+
+            // Request latest picture only if current date is greater than
+            // last saved date.
+            if (currentCal.isAfter(lastLatestAPodCal)) {
+                // Load latest APod from API
+                val currentDate = DateUtils.formatDate(currentCal.time)
+                try {
+                    val aPodResponse = withContext(Dispatchers.IO) {
+                        remoteSource.getApod(BuildConfig.API_KEY, currentDate)
+                    }
+                    if (aPodResponse.isSuccessful) {
+                        val latestApod = aPodResponse.body()
+                        // Ignoring null since db is our source of truth, data won't change
+                        if (latestApod != null) {
+                            localSource.insertApod(latestApod)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Timber.e(e.localizedMessage)
+                }
+            }
+        }
+    }
+
+    fun getAPods(): LiveData<PagedList<APod>> {
+        // PagedList config
+        // While it's recommended to have prefetch distance as large as possible compared
+        // to page size. In order to avoid calling API calls even before reaching end, I have
+        // set prefetch distance to 10
+        val pagedListConfig = PagedList.Config.Builder()
+            .setPageSize(20)
+            .setPrefetchDistance(10)
+            .build()
+
+        // Building LivePagedList
+        return LivePagedListBuilder(localSource.getApods(), pagedListConfig)
+            .setBoundaryCallback(aPodBoundaryCallback)
+            .build()
+    }
+}
